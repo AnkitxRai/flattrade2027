@@ -27,8 +27,10 @@ def fetch_nt_api_key():
         raise ValueError("NT API-key response did not contain an apiKey")
     return key
 
-def fetch_nt_total():
+def fetch_nt_total(crude=False):
     url     = "https://webapi.niftytrader.in/webapi/option/option-chain-data?symbol=nifty&exchange=nse&expiryDate=&atmBelow=5&atmAbove=5"
+    if crude:
+        url = "https://webapi.niftytrader.in/webapi/option/option-chain-data?symbol=crudeoilm&expiryDate=&exchange=MCX&atmBelow=0&atmAbove=0"
     headers = {"User-Agent": "Mozilla/5.0", "accept": "application/json"}
     try:
         headers["x-api-key"] = fetch_nt_api_key()
@@ -41,8 +43,10 @@ def fetch_nt_total():
     except Exception as e:
         print(f"❌ NT fetch error: {e}"); return None
 
-def get_day_change():
+def get_day_change(crude=False):
     url     = "https://webapi.niftytrader.in/webapi/symbol/today-spot-data?symbol=nifty&created_at="
+    if crude:
+        url = "https://webapi.niftytrader.in/webapi/symbol/today-spot-data?symbol=CRUDEOILM&exchange=mcx"
     headers = {"User-Agent": "Mozilla/5.0", "accept": "application/json"}
     try:
         headers["x-api-key"] = fetch_nt_api_key()
@@ -50,7 +54,7 @@ def get_day_change():
         response.raise_for_status()
         data = response.json()
         result = data.get("resultData") or {}
-        return result.get("last_trade_price"), result.get("change_value")
+        return result.get("last_trade_price"), result.get("change_value"), result.get("timestamp")
     except Exception as e:
         print(f"❌ Change fetch error: {e}"); return None
 
@@ -150,28 +154,34 @@ def send_telegram_message(msg, imp=True):
         return False
 
 if __name__ == "__main__":
-    last_minute = None
+    last_minute = {False: None, True: None}
     while True:
         started = time.monotonic()
         try:
-            option_chain = fetch_nt_total()
-            spot = get_day_change()
-            orderflow = fetch_orderflow()
-            ts, cvd = orderflow if orderflow else (None, None)
+            now = datetime.now(IST)
+            crude = (now.hour, now.minute) >= (15, 30)
+            option_chain = fetch_nt_total(crude)
+            spot = get_day_change(crude)
+            _, change, spot_ts = spot if spot else (None, None, None)
+            if crude:
+                ts, cvd = spot_ts, None
+            else:
+                orderflow = fetch_orderflow()
+                ts, cvd = orderflow if orderflow else (None, None)
             # If orderflow is unavailable, still send the other values this minute.
             try:
-                dt = datetime.fromisoformat(ts).astimezone(IST)
+                dt = datetime.fromisoformat(ts)
+                dt = dt.replace(tzinfo=IST) if dt.tzinfo is None else dt.astimezone(IST)
             except (TypeError, ValueError):
                 dt = datetime.now(IST)
             minute = dt.strftime("%Y-%m-%d %H:%M")
-            if last_minute is None or minute > last_minute:
+            if last_minute[crude] is None or minute > last_minute[crude]:
                 try:
                     totals = option_chain["resultData"]["opTotals"]["total_calls_puts"]
                     coi = float(totals["total_puts_change_oi"]) - float(totals["total_calls_change_oi"])
                 except (TypeError, ValueError, KeyError, OverflowError):
                     coi = None
-                _, change = spot if spot else (None, None)
-                last_minute = minute
+                last_minute[crude] = minute
                 format_output(dt.isoformat(), coi, change, cvd)
         except Exception as error:
             print("Fetch failed:", type(error).__name__)
