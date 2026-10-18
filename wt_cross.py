@@ -14,7 +14,6 @@ Stops are polled once per minute, not broker-resting stops. Unknown order
 outcomes halt for reconciliation. Runtime JSON/lock files preserve state.
 Formula adapted from WaveTrend with Crosses [LazyBear].
 """
-import argparse
 import ast
 from collections import deque
 from datetime import datetime, timedelta, time as dtime
@@ -575,6 +574,7 @@ def run(broker, args):
             anchor = int((now-timedelta(days=max(14, math.ceil(TIMEFRAME_MINUTES*100/300)*2))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
             store.data['history_start'] = min(anchor, store.data.get('history_start', anchor))
             store.save()
+            poll_errors = []
             for market, (strategy, executor) in runners.items():
                 enabled = settings[market] and config_ok
                 if not enabled and not executor.state(strategy.name)['position']:
@@ -588,9 +588,10 @@ def run(broker, args):
                         raise RuntimeError('Order unresolved; runner stopped for broker reconciliation.') from error
                     detail = str(error) if isinstance(error, (ValueError, RuntimeError)) else 'Check connection/session'
                     print(f'{market} poll failed ({type(error).__name__}): {detail}; other market continues.', flush=True)
-                    if args.once:
-                        raise
+                    poll_errors.append(f'{market}: {detail}')
             if args.once:
+                if poll_errors:
+                    raise RuntimeError('One-shot poll failed: ' + '; '.join(poll_errors))
                 break
             time.sleep(max(.1, 60-time.time()%60))
 
@@ -636,119 +637,4 @@ def check_connection(broker, args):
             print(f'{market}: CHECK FAILED ({type(error).__name__}): {detail}')
     print('Read-only check finished. No orders placed or state files changed.')
     if failed:
-        raise SystemExit(1)
-
-
-def replay_day(broker, args):
-    """Rebuild forming candles from minute bars. Never send real orders."""
-    global MARKET, ENTRY_START, EXIT_TIME
-    import contextlib
-    import io
-    settings = read_settings()
-    globals().update(settings)
-    day = datetime.strptime(args.replay, '%Y-%m-%d').replace(tzinfo=IST)
-    if day.date() >= datetime.now(IST).date():
-        raise ValueError('Replay requires a completed historical date')
-    end = day+timedelta(days=1)
-    lookback = day-timedelta(days=max(14, math.ceil(TIMEFRAME_MINUTES*100/300)*2))
-    result = {'date': args.replay, 'mode': 'HISTORICAL SIMULATION', 'markets': {},
-              'limitations': ['Minute-close observations, not tick-level replay.',
-                              'Option selection uses currently searchable contracts; expired/unlisted contracts may be unavailable.',
-                              'Simulated premium fills use historical minute closes, excluding fees and slippage.']}
-
-    class HistoricalBroker:
-        def __init__(self, real):
-            self.real, self.now, self.prices = real, day, {}
-        def search_options(self,*a,**kw): return self.real.search_options(*a,**kw)
-        def security_info(self,*a,**kw): return self.real.security_info(*a,**kw)
-        def order(self,*a,**kw): raise RuntimeError('Real orders are forbidden in historical replay')
-        def option_price(self,leg):
-            key=(leg['exchange'],leg['token'])
-            if key not in self.prices:
-                self.prices[key]=normalize(self.real.candles(leg['token'],int(day.timestamp()),
-                    int(end.timestamp()),exchange=leg['exchange'],interval=1),end)
-            available=[c for c in self.prices[key]
-                       if datetime.fromisoformat(c['datetime'])+timedelta(minutes=1)<=self.now]
-            if not available:
-                raise ValueError('No historical option premium at signal time')
-            last=available[-1]
-            if self.now-datetime.fromisoformat(last['datetime'])>timedelta(minutes=2):
-                raise ValueError('Historical option premium is stale at signal time')
-            return last['close']
-
-    print(f'HISTORICAL SIMULATION {args.replay}; underlying minute bars -> {TIMEFRAME_MINUTES}m forming candles',flush=True)
-    print('No broker orders will be placed. Current contract listings are not a historical instrument master.',flush=True)
-    for market in ('NIFTY','CRUDE'):
-        MARKET=market
-        ENTRY_START,EXIT_TIME=settings[f'{market}_START_TIME'],settings[f'{market}_END_TIME']
-        details={'events': [], 'error': None}
-        result['markets'][market]=details
-        try:
-            exchange='NSE' if market=='NIFTY' else 'MCX'
-            selector=OptionSelector(broker,args.lots,market)
-            if market=='CRUDE':
-                feed=resolve_crude_feed(broker,day.date())
-                token,symbol=feed['token'],feed['symbol']
-                selector.expiry_required=datetime.fromisoformat(feed['option_expiry']).date()
-            else:
-                token,symbol=args.nifty_token,'NIFTY'
-            warm=normalize(broker.candles(token,int(lookback.timestamp()),int(day.timestamp()),
-                           exchange=exchange,interval=TIMEFRAME_MINUTES),day)
-            warm=[c for c in warm if datetime.fromisoformat(c['datetime'])<day]
-            minutes=normalize(broker.candles(token,int(day.timestamp()),int(end.timestamp()),exchange=exchange,interval=1),end)
-            minutes=[c for c in minutes if datetime.fromisoformat(c['datetime']).date()==day.date()]
-            if len(warm)<100 or not minutes:
-                raise ValueError(f'Insufficient history: {len(warm)} warm-up candles, {len(minutes)} minute candles')
-            details.update(symbol=symbol,token=token,warmup_candles=len(warm),minute_candles=len(minutes))
-            data_path=ROOT/f'replay_{market.lower()}_{args.replay}_candles.json'
-            data_path.write_text(json.dumps({'warmup':warm,'minutes':minutes},indent=2)+'\n')
-            print(f'{market}: {symbol}, {len(warm)} warm-up candles, {len(minutes)} minute candles fetched',flush=True)
-            # Replay state is independent of live/paper runtime state and starts flat.
-            import tempfile
-            with tempfile.TemporaryDirectory() as directory:
-                history=HistoricalBroker(broker)
-                executor=Executor(history,Store(Path(directory)/'state.json'),selector=selector)
-                strategy=Strategy();strategy.name=f'wt_cross_{market.lower()}'
-                previous=Strategy().observe(warm)['value']
-                executor.state(strategy.name)['previous']=previous
-                buckets={}
-                session_open=dtime(9,15) if market=='NIFTY' else dtime(9,0)
-                anchor=day.replace(hour=session_open.hour,minute=session_open.minute)
-                for candle in minutes:
-                    timestamp=datetime.fromisoformat(candle['datetime'])
-                    if timestamp<anchor:
-                        continue
-                    now=timestamp+timedelta(minutes=1)
-                    history.now=now
-                    offset=int((timestamp-anchor).total_seconds()//(TIMEFRAME_MINUTES*60))
-                    bucket=anchor+timedelta(minutes=offset*TIMEFRAME_MINUTES)
-                    if bucket not in buckets:
-                        buckets[bucket]={**candle,'datetime':bucket.isoformat()}
-                    else:
-                        b=buckets[bucket]
-                        b.update(high=max(b['high'],candle['high']),low=min(b['low'],candle['low']),close=candle['close'])
-                    snapshot=warm+[buckets[t] for t in sorted(buckets)]
-                    observation=strategy.observe(snapshot,executor.state(strategy.name)['previous'])
-                    before=len(executor.store.data['events'])
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        manage(strategy,executor,observation,candle['close'],now)
-                    for event in executor.store.data['events'][before:]:
-                        details['events'].append(event)
-                        leg=event['leg']
-                        print(f"{event['time']} | {market} | {event['event']} | {event['side']} | "
-                              f"{'BUY' if event['event']=='ENTRY' else 'SELL'} {leg['symbol']} | "
-                              f"qty={leg['quantity']} | premium={event['fill']} | underlying={event['spot']} | "
-                              f"{event['reason']} | SIMULATED",flush=True)
-                details['open_position']=executor.state(strategy.name)['position']
-                if details['open_position']:
-                    details['error']='Position remains open: history did not provide a successful exit at/beyond end time'
-                details['entries']=sum(e['event']=='ENTRY' for e in details['events'])
-                details['exits']=sum(e['event']=='EXIT' for e in details['events'])
-        except Exception as error:
-            details['error']=str(error) if isinstance(error,(ValueError,RuntimeError)) else f'{type(error).__name__}: broker/data request failed'
-            print(f'{market}: replay incomplete: {details["error"]}',flush=True)
-    path=ROOT/f'replay_{args.replay}.json'
-    path.write_text(json.dumps(result,indent=2)+'\n')
-    print(f'Saved {path}. Real broker orders sent: 0.',flush=True)
-    if any(v['error'] for v in result['markets'].values()):
         raise SystemExit(1)
