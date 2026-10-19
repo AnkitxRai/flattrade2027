@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Login/session owner. Start with: python3 2027/main.py --lots 1
-Default is paper; add --live for real orders. Fill in the credential constants
-below before running. No environment variables or .env file are required.
+Default is LIVE trading; use --paper for simulation or --check for read-only diagnostics.
+Fill in credentials.py before running. No environment variables or .env file are required.
 Dependencies: requests, pyotp, websocket-client.
 """
 import argparse
@@ -59,8 +59,11 @@ def create_api():
 
         def positions(self):
             result = self.request('/PositionBook', {'actid': self.userid})
-            if isinstance(result, dict) and result.get('emsg', '').lower().startswith('no data'):
-                return []
+            if isinstance(result, dict):
+                message = ' '.join(str(result.get('emsg', '')).lower().split())
+                # PositionBook uses this wrapped error for an empty position book.
+                if message in ('no data', 'error occurred : 5 "no data"'):
+                    return []
             if not isinstance(result, list):
                 message = str(result.get('emsg', 'Unexpected PositionBook response')) if isinstance(result, dict) else 'Unexpected PositionBook response type'
                 for secret in (self.userid, self.jkey):
@@ -91,15 +94,20 @@ def create_api():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--live', action='store_true')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--live', dest='live', action='store_true', help='Live trading (default)')
+    modes.add_argument('--paper', dest='live', action='store_false', help='Paper simulation; no real orders')
+    parser.set_defaults(live=None)
     parser.add_argument('--lots', type=int, default=1, help='Number of option lots (default 1); lot size comes from broker')
     parser.add_argument('--nifty-token', default='26000', help='NSE NIFTY index token; verify with broker')
     parser.add_argument('--state', type=Path)
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--check', action='store_true', help='Read-only candle/quote/option diagnostics; no orders or state changes')
     args = parser.parse_args()
-    if args.check and args.live:
+    if args.check and args.live is True:
         parser.error('--check cannot be combined with --live')
+    args.live = False if args.check else (True if args.live is None else args.live)
+    print('Mode: ' + ('READ-ONLY CHECK' if args.check else 'LIVE — real orders enabled' if args.live else 'PAPER — simulated orders'), flush=True)
     if args.lots < 1:
         parser.error('--lots must be positive')
     credentials = {
