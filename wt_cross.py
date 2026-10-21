@@ -248,7 +248,7 @@ class Executor:
         store.data.setdefault('events', [])
         store.save()
 
-    def archive_attempts(self, reason, preserve_positions=False):
+    def archive_attempts(self, reason, preserve_positions=False, strategy_name=None):
         """Retain unresolved intents and exposed positions without resubmission."""
         pending = self.store.data.pop('pending', None)
         unresolved = self.store.data.pop('unresolved_orders', {})
@@ -261,7 +261,7 @@ class Executor:
                 'resolution': 'unconfirmed_no_retry', 'reason': reason, 'intent': intent})
         # An interrupted exit must not be submitted again after a restart.
         for name, state in self.store.data.get('strategies', {}).items():
-            if not preserve_positions and state.get('close_attempted') and state.get('position'):
+            if not preserve_positions and name == strategy_name and state.get('close_attempted') and state.get('position'):
                 self.store.data.setdefault('unmanaged_positions', []).append({
                     'strategy': name, 'position': state['position'],
                     'reason': 'close outcome unconfirmed; no automatic retry'})
@@ -297,7 +297,7 @@ class Executor:
         try:
             self._exit(name, spot, now, reason)
         except Exception as error:
-            self.archive_attempts('close attempted once; outcome unconfirmed')
+            self.archive_attempts('close attempted once; outcome unconfirmed', strategy_name=name)
             self.store.data.setdefault('attempt_errors', []).append({
                 'strategy': name, 'time': now.isoformat(), 'action': 'exit',
                 'error_type': type(error).__name__})
@@ -585,6 +585,8 @@ def manage(strategy, executor, observation, spot, now, allow_entry=True):
     if signal and position and position['side'] != signal:
         executor.exit(strategy.name, spot, now, 'WT1 reverse crossing')
         position = None
+    if state.get('baseline_required'):
+        allow_entry = False  # Manual close detected during the exit precheck: wait for a new crossover.
     if signal and allow_entry and ENTRY_START <= now.time() < EXIT_TIME:
         if not position and state['stopped_side'] != signal:
             executor.enter(strategy.name, signal, spot, now)
