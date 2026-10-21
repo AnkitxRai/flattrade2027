@@ -71,11 +71,11 @@ def create_api():
             return result
 
         def order(self, leg, action, tag):
-            if leg.get('product') != 'I':
-                raise ValueError('Only intraday product I is allowed')
+            if leg.get('product') != 'I' and not (leg.get('product') == 'M' and leg.get('exchange') == 'MCX' and leg.get('symbol', '').startswith('CRUDEOILM')):
+                raise ValueError('Product M is allowed only for MCX CRUDEOILM; otherwise use I')
             return self.request('/PlaceOrder', {
                 'ordersource': 'API', 'actid': self.userid, 'trantype': action,
-                'prd': 'I', 'exch': leg['exchange'], 'tsym': leg['symbol'],
+                'prd': leg['product'], 'exch': leg['exchange'], 'tsym': leg['symbol'],
                 'qty': str(leg['quantity']), 'prctyp': 'MKT', 'prc': '0',
                 'ret': 'DAY', 'remarks': tag})
 
