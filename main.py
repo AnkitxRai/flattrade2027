@@ -13,6 +13,31 @@ from credentials import USER_ID, PASSWORD, TOTP_SECRET, APP_KEY
 
 
 
+TELEGRAM = True
+
+
+def send_telegram_message(msg, imp=True):
+    if not TELEGRAM:
+        return False
+    try:
+        import requests
+        BOT_TOKEN = '8331147432:AAGSG4mI8d87sWEBsY0qtarAtwWbpa4viq0'
+        CHANNEL_ID = '-1003494200670'
+        CHANNEL_ID_IMP = '-1003448158591'
+        # Never expose authentication values in an alert.
+        for secret in (USER_ID, PASSWORD, TOTP_SECRET, APP_KEY, BOT_TOKEN):
+            if secret:
+                msg = msg.replace(str(secret), '[REDACTED]')
+        response = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                                 data={'chat_id': CHANNEL_ID_IMP if imp else CHANNEL_ID,
+                                       'text': msg[:4000]}, timeout=10)
+        response.raise_for_status()
+        return response.json().get('ok') is True
+    except Exception as error:
+        print('Telegram failed:', type(error).__name__, flush=True)
+        return False
+
+
 def create_api():
     from NorenWebApi import NorenWebApi
 
@@ -118,13 +143,28 @@ def main():
     }
     if not all(credentials.values()):
         parser.error('Fill USER_ID, PASSWORD, TOTP_SECRET and APP_KEY in credentials.py')
-    api = create_api()
-    api.login(**credentials)  # One authenticated session shared with strategy files.
+    send_telegram_message('▶️ main.py started')
+    try:
+        api = create_api()
+        api.notify = send_telegram_message
+        api.login(**credentials)  # One session shared with strategy files.
+    except Exception as error:
+        send_telegram_message(f'❌ Login/startup failed | {type(error).__name__}')
+        raise
+    send_telegram_message('✅ Login successful')
     import wt_cross
-    if args.check:
-        wt_cross.check_connection(api, args)
-    else:
-        wt_cross.run(api, args)
+    try:
+        if args.check:
+            wt_cross.check_connection(api, args)
+        else:
+            wt_cross.run(api, args)
+    except Exception as error:
+        detail = str(error) if isinstance(error, (RuntimeError, ValueError)) else type(error).__name__
+        send_telegram_message(f'❌ Runner stopped | {detail}')
+        raise
+    except KeyboardInterrupt:
+        send_telegram_message('⏹ Runner stopped manually')
+        raise
 
 
 if __name__ == '__main__':

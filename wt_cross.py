@@ -11,7 +11,7 @@ Default: 1 lot, 50 underlying-point SL. NIFTY exit 15:13, CRUDE exit 23:00 IST.
 CRUDE uses mini CRUDEOILM options and futures. Missing discovery data blocks
 entries; no expiry dates, contract tokens or lot sizes are hardcoded.
 Stops are polled once per minute, not broker-resting stops. Unknown order
-outcomes halt for reconciliation. Runtime JSON/lock files preserve state.
+outcomes pause the affected strategy for reconciliation. Runtime JSON/lock files preserve state.
 Formula adapted from WaveTrend with Crosses [LazyBear].
 """
 import ast
@@ -220,6 +220,16 @@ def validate_legs(legs):
     return legs
 
 
+def notify(broker, message):
+    """Optional callback supplied by main.py; notification failure cannot halt trades."""
+    try:
+        sender = getattr(broker, 'notify', None)
+        if callable(sender):
+            sender(message)
+    except Exception:
+        print('Telegram notification failed', flush=True)
+
+
 class Executor:
     def __init__(self, broker, store, live=False, legs=None, selector=None):
         self.broker, self.store, self.live = broker, store, live
@@ -229,11 +239,69 @@ class Executor:
         if store.data.get('mode', mode) != mode:
             raise ValueError('Use separate state files for paper and live')
         if store.data.get('pending'):
-            raise RuntimeError('Unresolved order in state file: reconcile broker fills before restarting; do not delete the state to retry')
+            self.recover_pending()
         store.data['mode'] = mode
         store.data.setdefault('strategies', {})
         store.data.setdefault('events', [])
         store.save()
+
+    def recover_pending(self):
+        """Archive proven zero-fill terminal orders; never resubmit or discard history."""
+        pending = self.store.data['pending']
+        order_id = pending.get('order_id')
+        blocked = ('Pending order needs reconciliation; no orders sent. '
+                   'Broker must confirm rejected/cancelled status and zero fills.')
+        if not self.live or not order_id:
+            raise RuntimeError(blocked)
+        rows = self.broker.history(order_id)
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError(blocked)
+        leg = pending.get('leg', {})
+        terminal = []
+        for row in rows:
+            if str(row.get('norenordno')) != str(order_id):
+                raise RuntimeError(blocked)
+            # History may contain older PENDING rows. Any evidence of a fill
+            # takes precedence over a terminal row reporting zero fills.
+            if row.get('status') == 'COMPLETE':
+                raise RuntimeError(blocked)
+            for key in ('fillshares', 'avgprc'):
+                value = row.get(key)
+                if value not in (None, ''):
+                    try:
+                        number = float(value)
+                    except (ValueError, TypeError):
+                        raise RuntimeError(blocked)
+                    if not math.isfinite(number) or number != 0:
+                        raise RuntimeError(blocked)
+            if row.get('status') in ('REJECTED', 'CANCELED', 'CANCELLED'):
+                # Missing fill quantity is not proof of zero executions.
+                if row.get('fillshares') in (None, ''):
+                    continue
+                if (row.get('tsym') != leg.get('symbol')
+                        or row.get('exch') != leg.get('exchange')
+                        or row.get('trantype') != pending.get('action')
+                        or row.get('prd') != leg.get('product')):
+                    raise RuntimeError(blocked)
+                terminal.append(row)
+        if not terminal:
+            raise RuntimeError(blocked)
+        # A single atomic save preserves the full intent and broker history
+        # while removing only the startup blocker, including for old dates.
+        record = {'resolved_at': datetime.now(IST).isoformat(),
+                  'resolution': 'terminal_zero_fill', 'order_id': str(order_id),
+                  'status': terminal[0]['status'], 'filled_quantity': 0,
+                  'reason': terminal[0].get('rejreason', terminal[0].get('emsg', '')),
+                  'intent': pending, 'broker_history': rows}
+        self.store.data.setdefault('order_history', []).append(record)
+        del self.store.data['pending']
+        try:
+            self.store.save()
+        except Exception:
+            self.store.data['pending'] = pending
+            self.store.data['order_history'].pop()
+            raise
+        print(f"Archived {record['status']} order {order_id} with zero fills; pending cleared.", flush=True)
 
     def reconcile(self):
         """Require broker net quantities to match our ledger on managed instruments."""
@@ -245,6 +313,8 @@ class Executor:
             pos = state.get('position')
             if pos:
                 leg = pos['leg']
+                if self.selector and (leg['exchange'] != self.selector.exchange or not leg['symbol'].startswith(self.selector.root)):
+                    continue
                 instrument = key(leg)
                 expected[instrument] = expected.get(instrument, 0) + leg['quantity'] * (1 if leg['action'] == 'B' else -1)
         actual = dict.fromkeys(expected, 0)
@@ -263,6 +333,8 @@ class Executor:
             'position': None, 'previous': None, 'stopped_side': None})
 
     def submit(self, name, leg, action, reason, entry_order_id=None):
+        if self.store.data.get('pending') or name in self.store.data.get('unresolved_orders', {}):
+            raise RuntimeError('Unresolved order for this strategy; duplicate submission blocked')
         if leg.get('product') != 'I':
             raise ValueError('Only intraday product I is allowed')
         intent = {'strategy': name, 'leg': leg, 'action': action,
@@ -274,6 +346,7 @@ class Executor:
             raise RuntimeError('Order not confirmed; reconcile pending intent before continuing')
         intent['order_id'] = result['norenordno']
         self.store.save()
+        notify(self.broker, f"📨 Order submitted (not yet filled) | {name} | {action} {leg['symbol']} | qty {leg['quantity']} | I | ID {intent['order_id']} | {datetime.now(IST).isoformat()}")
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             rows = self.broker.history(intent['order_id'])
@@ -283,8 +356,10 @@ class Executor:
                         price = float(row['avgprc'])
                         if not math.isfinite(price) or price <= 0:
                             raise RuntimeError('Invalid broker fill price')
+                        notify(self.broker, f"✅ Order filled | {name} | {action} {leg['symbol']} | qty {leg['quantity']} | price {price} | ID {intent['order_id']} | {reason} | {datetime.now(IST).isoformat()}")
                         return {'price': price, 'order_id': intent['order_id']}
                     if row.get('status') in ('REJECTED', 'CANCELED'):
+                        notify(self.broker, f"❌ Order {row['status']} | {name} | ID {intent['order_id']} | {row.get('rejreason', 'No reason returned')}")
                         raise RuntimeError('Order rejected/canceled; reconcile any partial fill before restarting')
             time.sleep(1)
         raise RuntimeError('Order still pending or partially filled; runner halted for reconciliation')
@@ -529,6 +604,40 @@ def apply_settings(settings, store):
         store.save()
 
 
+def park_pending(store):
+    """Move a single in-flight intent into the per-strategy unresolved queue."""
+    pending = store.data.get('pending')
+    if not pending:
+        return
+    name = pending.get('strategy')
+    if name not in ('wt_cross_nifty', 'wt_cross_crude'):
+        raise RuntimeError('Pending order has unknown strategy; manual reconciliation required')
+    unresolved = store.data.setdefault('unresolved_orders', {})
+    if name in unresolved and unresolved[name] != pending:
+        raise RuntimeError('Conflicting unresolved orders; refusing to overwrite records')
+    unresolved[name] = pending
+    del store.data['pending']
+    store.save()
+
+
+def check_unresolved(executor, name):
+    store = executor.store
+    pending = store.data.get('unresolved_orders', {}).get(name)
+    if not pending:
+        return
+    # Recovery is sequential under the runner lock. Leave the queue entry on
+    # disk until recovery succeeds, so a crash cannot lose the order record.
+    store.data['pending'] = pending
+    try:
+        executor.recover_pending()
+    except Exception:
+        store.data.pop('pending', None)
+        raise
+    else:
+        del store.data['unresolved_orders'][name]
+        store.save()
+
+
 def run(broker, args):
     """Shared session, one loop, independent NIFTY and CRUDE positions."""
     global MARKET, ENTRY_START, EXIT_TIME
@@ -553,13 +662,13 @@ def run(broker, args):
                 if old.get('pending') or any(st.get('position') for st in old.get('strategies', {}).values()):
                     raise ValueError(f'Open trade/order in legacy state {old_path.name}; reconcile before using the combined runner')
         apply_settings(settings, store)
+        park_pending(store)
+        last_alerts = {}
         runners = {}
         for market in ('NIFTY', 'CRUDE'):
             strategy = Strategy()
             strategy.name = f'wt_cross_{market.lower()}'
             executor = Executor(broker, store, args.live, selector=OptionSelector(broker, args.lots, market))
-            if settings[market] or executor.state(strategy.name)['position']:
-                executor.reconcile()
             runners[market] = (strategy, executor)
         while True:
             config_ok = True
@@ -577,17 +686,24 @@ def run(broker, args):
             poll_errors = []
             for market, (strategy, executor) in runners.items():
                 enabled = settings[market] and config_ok
-                if not enabled and not executor.state(strategy.name)['position']:
+                if not enabled and not executor.state(strategy.name)['position'] and strategy.name not in store.data.get('unresolved_orders', {}):
                     continue
                 MARKET = market
                 ENTRY_START, EXIT_TIME = settings[f'{market}_START_TIME'], settings[f'{market}_END_TIME']
                 try:
+                    check_unresolved(executor, strategy.name)
+                    executor.reconcile()
                     cycle(broker, executor, [strategy], args.nifty_token, now, allow_entry=enabled)
+                    last_alerts.pop(market, None)
                 except Exception as error:
                     if store.data.get('pending'):
-                        raise RuntimeError('Order unresolved; runner stopped for broker reconciliation.') from error
+                        park_pending(store)
                     detail = str(error) if isinstance(error, (ValueError, RuntimeError)) else 'Check connection/session'
                     print(f'{market} poll failed ({type(error).__name__}): {detail}; other market continues.', flush=True)
+                    previous_alert = last_alerts.get(market)
+                    if previous_alert is None or previous_alert[0] != detail or time.monotonic()-previous_alert[1] >= 900:
+                        notify(broker, f'⚠️ {market} poll paused/error | {detail} | other strategy continues')
+                        last_alerts[market] = (detail, time.monotonic())
                     poll_errors.append(f'{market}: {detail}')
             if args.once:
                 if poll_errors:
