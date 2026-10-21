@@ -79,6 +79,20 @@ def create_api():
                 'qty': str(leg['quantity']), 'prctyp': 'MKT', 'prc': '0',
                 'ret': 'DAY', 'remarks': tag})
 
+        def stop_order(self, leg, trigger, limit, tag):
+            if leg.get('action') != 'B' or leg.get('product') not in ('I', 'M'):
+                raise ValueError('Stop orders require a recorded long option position')
+            if not 0 < limit <= trigger:
+                raise ValueError('Invalid sell-stop limit/trigger')
+            return self.request('/PlaceOrder', {
+                'ordersource': 'API', 'actid': self.userid, 'trantype': 'S',
+                'prd': leg['product'], 'exch': leg['exchange'], 'tsym': leg['symbol'],
+                'qty': str(leg['quantity']), 'prctyp': 'SL-LMT',
+                'prc': str(limit), 'trgprc': str(trigger), 'ret': 'DAY', 'remarks': tag})
+
+        def cancel_stop(self, order_id):
+            return self.request('/CancelOrder', {'ordersource': 'API', 'norenordno': order_id})
+
         def history(self, order_id):
             return self.request('/SingleOrdHist', {'ordersource': 'API', 'norenordno': order_id})
 

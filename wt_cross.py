@@ -3,14 +3,14 @@
 Call run(api, args) from main.py; this file never logs in.
 NIFTY/CRUDE flags, their start/end times, timeframe and indicator/SL settings
 are reread from this file every minute. Both markets can run together.
-WT1 uses the forming candle, recalculated every minute.
+WT1 uses completed candles only, evaluated once per candle; polling remains every minute.
 LONG buys the closest strictly ITM call; SHORT buys the closest ITM put.
 NIFTY rolls at <=2 inclusive weekdays, matching rmi.py. CRUDE rolls to
 next month with <3 calendar days left; candles use that month's futures.
-Default: 1 lot, 50 underlying-point SL. NIFTY exit 15:13, CRUDE exit 23:00 IST.
+Default: 1 lot; NIFTY/CRUDE option-premium SL distances are separately configurable. NIFTY exit 15:13, CRUDE exit 23:00 IST.
 CRUDE uses mini CRUDEOILM options and futures. Missing discovery data blocks
 entries; no expiry dates, contract tokens or lot sizes are hardcoded.
-Stops are polled once per minute, not broker-resting stops. Unknown order
+Live option stops use broker-held SL-LMT orders after confirmed entry fills. Unknown order
 outcomes pause the affected strategy for reconciliation. Runtime JSON/lock files preserve state.
 Formula adapted from WaveTrend with Crosses [LazyBear].
 """
@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, time as dtime
 import fcntl
 import json
 import math
+from decimal import Decimal, ROUND_FLOOR
 import os
 from pathlib import Path
 import re
@@ -31,14 +32,17 @@ from zoneinfo import ZoneInfo
 NIFTY = True
 NIFTY_START_TIME = dtime(9, 45)
 NIFTY_END_TIME = dtime(15, 13)
-NIFTY_SL_POINTS = 50.0  # NIFTY index points; 0 disables SL
+NIFTY_SL_POINTS = 35.0  # option premium points; 0 disables SL
 
 CRUDE = True
 CRUDE_START_TIME = dtime(9, 30)
 CRUDE_END_TIME = dtime(23, 0)
-CRUDE_SL_POINTS = 50.0  # CRUDEOILM futures points; 0 disables SL
+CRUDE_SL_POINTS = 50.0  # option premium points; 0 disables SL
 
-TIMEFRAME_MINUTES = 15  # 1, 3, 5, 10, 15, 30, 60, 120, 240
+SL_LIMIT_BUFFER = 5.0  # Sell limit sits this many premium points below the trigger.
+
+NIFTY_TIMEFRAME_MINUTES = 5
+CRUDE_TIMEFRAME_MINUTES = 15  # Allowed: 1, 3, 5, 10, 15, 30, 60, 120, 240
 # All times are IST. Polling remains every minute. Flags control new entries;
 # existing positions still receive SL, reverse-signal and end-time exits.
 
@@ -230,6 +234,10 @@ def notify(broker, message):
         print('Telegram notification failed', flush=True)
 
 
+class StopOrderError(RuntimeError):
+    """Stop status is uncertain: retain the position and avoid a second sell."""
+
+
 class Executor:
     def __init__(self, broker, store, live=False, legs=None, selector=None, fresh_alerts=False):
         self.broker, self.store, self.live = broker, store, live
@@ -274,6 +282,9 @@ class Executor:
             return self._enter(name, side, spot, now)
         try:
             return self._enter(name, side, spot, now)
+        except StopOrderError as error:
+            notify(self.broker, f'🚨 {name}: entry recorded but broker SL not confirmed | {error}')
+            raise
         except Exception as error:
             self.archive_attempts('entry attempt failed/unconfirmed; wait for a fresh crossover')
             self.store.data.setdefault('attempt_errors', []).append({
@@ -296,6 +307,10 @@ class Executor:
         self.store.save()
         try:
             self._exit(name, spot, now, reason)
+        except StopOrderError:
+            state.pop('close_attempted', None)
+            self.store.save()
+            raise
         except Exception as error:
             self.archive_attempts('close attempted once; outcome unconfirmed', strategy_name=name)
             self.store.data.setdefault('attempt_errors', []).append({
@@ -443,6 +458,8 @@ class Executor:
                              'time': now.isoformat(), 'leg': leg, 'entry_order_id': entry_order_id}
         self.store.data.pop('pending', None)
         self.event(name, 'ENTRY', side, spot, now, leg=leg, fill=fill, entry_order_id=entry_order_id)
+        if self.live:
+            self.protect_position(name, now)
 
     def verify_entry(self, position):
         """Verify the recorded entry ID; regular intraday exits use offset orders."""
@@ -465,7 +482,105 @@ class Executor:
                     return
         raise RuntimeError('Recorded entry ID does not match confirmed contract/quantity; no exit sent')
 
-    def sync_position(self, name, now):
+    def stop_status(self, position):
+        stop = position.get('broker_sl')
+        if not stop:
+            return None
+        if not stop.get('order_id'):
+            raise StopOrderError('SL submission not confirmed; check broker before another sell')
+        rows = self.broker.history(stop['order_id'])
+        if not isinstance(rows, list) or not rows:
+            raise StopOrderError('SL order history unavailable')
+        matching = [r for r in rows if str(r.get('norenordno')) == str(stop['order_id'])]
+        if not matching:
+            raise StopOrderError('SL order history ID mismatch')
+        # Broker history is newest first; a complete fill takes precedence.
+        row = next((r for r in matching if r.get('status') == 'COMPLETE'), matching[0])
+        leg = position['leg']
+        if (row.get('tsym') != leg['symbol'] or row.get('exch') != leg['exchange']
+                or row.get('prd') != leg['product'] or row.get('trantype') != 'S'):
+            raise StopOrderError('SL contract/product does not match position')
+        filled = int(row.get('fillshares') or 0)
+        if filled not in (0, leg['quantity']):
+            raise StopOrderError('SL partially filled; reconcile remaining quantity')
+        if row.get('status') == 'COMPLETE' and filled != leg['quantity']:
+            raise StopOrderError('SL complete quantity mismatch')
+        stop['status'] = row.get('status')
+        stop['filled_quantity'] = filled
+        stop['fill_price'] = row.get('avgprc')
+        self.store.save()
+        return row
+
+    def release_stop(self, position):
+        """Confirm the resting stop is terminal before a discretionary sell."""
+        row = self.stop_status(position)
+        if row is None:
+            return
+        terminal = ('COMPLETE', 'CANCELED', 'CANCELLED', 'REJECTED')
+        if row.get('status') in terminal:
+            return
+        stop = position['broker_sl']
+        if stop.get('cancel_requested'):
+            raise StopOrderError('SL cancellation still unconfirmed; no second sell sent')
+        stop['cancel_requested'] = True
+        self.store.save()
+        try:
+            self.broker.cancel_stop(stop['order_id'])
+        except Exception as error:
+            raise StopOrderError('SL cancellation response lost; check order status') from error
+        row = self.stop_status(position)
+        if row.get('status') not in terminal:
+            raise StopOrderError('Waiting for SL cancellation/fill confirmation')
+
+    def protect_position(self, name, now):
+        state = self.state(name)
+        pos = state['position']
+        if not self.live or not pos:
+            return
+        points = CRUDE_SL_POINTS if pos['leg']['exchange'] == 'MCX' else NIFTY_SL_POINTS
+        if points <= 0:
+            return
+        if pos.get('broker_sl'):
+            row = self.stop_status(pos)
+            if row['status'] in ('REJECTED', 'CANCELED', 'CANCELLED'):
+                if datetime.fromisoformat(pos['broker_sl']['created_at']).date() < now.date() and int(row.get('fillshares') or 0) == 0:
+                    pos.setdefault('sl_history', []).append(pos.pop('broker_sl'))
+                    self.store.save()
+                else:
+                    raise StopOrderError('Position has no active broker SL; previous stop rejected/cancelled')
+            else:
+                return
+        leg = pos['leg']
+        info = self.broker.security_info(leg['exchange'], leg['token'])
+        if info.get('tsym') != leg['symbol']:
+            raise StopOrderError('SL tick-size lookup contract mismatch')
+        tick = Decimal(str(info['ti']))
+        if not tick.is_finite() or tick <= 0:
+            raise StopOrderError('Invalid broker tick size')
+        trigger = ((Decimal(str(pos['fill']))-Decimal(str(points)))/tick).to_integral_value(rounding=ROUND_FLOOR)*tick
+        limit = ((trigger-Decimal(str(SL_LIMIT_BUFFER)))/tick).to_integral_value(rounding=ROUND_FLOOR)*tick
+        if limit <= 0:
+            raise StopOrderError('SL distance/buffer exceeds option premium; position not protected')
+        stop = {'trigger': float(trigger), 'limit': float(limit), 'points': points,
+                'tag': f'sl-{uuid.uuid4().hex[:12]}', 'created_at': now.isoformat(), 'status': 'SUBMITTING'}
+        pos['broker_sl'] = stop
+        self.store.save()  # Never blindly resubmit after an uncertain response.
+        try:
+            result = self.broker.stop_order(leg, float(trigger), float(limit), stop['tag'])
+        except Exception as error:
+            raise StopOrderError('SL submission response lost; position remains recorded') from error
+        if not isinstance(result, dict) or result.get('stat') != 'Ok' or not result.get('norenordno'):
+            stop['status'] = 'SUBMISSION_FAILED'
+            self.store.save()
+            raise StopOrderError('Broker did not accept SL; position remains recorded and unprotected')
+        stop['order_id'] = str(result['norenordno'])
+        self.store.save()
+        row = self.stop_status(pos)
+        if row.get('status') not in ('TRIGGER_PENDING', 'OPEN', 'COMPLETE'):
+            raise StopOrderError(f"SL not confirmed active: {row.get('status')}")
+        notify(self.broker, f"🛡️ {name} SL {row['status']} | {leg['symbol']} | trigger {trigger} | limit {limit} | ID {stop['order_id']}")
+
+    def sync_position(self, name, now, own_exit=False):
         """Check the recorded contract/product; never assume an API failure is flat."""
         state = self.state(name)
         position = state['position']
@@ -480,9 +595,16 @@ class Executor:
                        and row.get('tsym') == leg['symbol']
                        and row.get('prd') == leg['product'])
         if quantity == 0:
+            if position.get('broker_sl'):
+                self.release_stop(position)
+            stop = position.get('broker_sl', {})
+            stopped = stop.get('status') == 'COMPLETE'
+            if stopped:
+                state['stopped_side'] = position['side']
+                notify(self.broker, f"🛑 {name}: broker SL filled | {leg['symbol']} | ID {stop['order_id']} | price {stop.get('fill_price')}")
             self.store.data.setdefault('position_history', []).append({
                 'strategy': name, 'time': now.isoformat(), 'position': position,
-                'status': 'externally_closed', 'exit_price': None})
+                'status': 'broker_sl_filled' if stopped else 'externally_closed', 'exit_price': stop.get('fill_price')})
             state['position'] = None
             state.pop('close_attempted', None)
             state['baseline_required'] = True
@@ -492,7 +614,7 @@ class Executor:
         expected = leg['quantity'] * (1 if leg['action'] == 'B' else -1)
         if quantity != expected:
             raise RuntimeError(f'{name}: broker quantity {quantity} differs from recorded {expected}; no automatic exit sent')
-        if state.get('close_attempted'):
+        if state.get('close_attempted') and not own_exit:
             raise RuntimeError(f'{name}: prior exit outcome uncertain; position retained, no duplicate exit sent')
         return False
 
@@ -506,6 +628,12 @@ class Executor:
             if not self.fresh_alerts:
                 self.reconcile()
             leg = pos['leg']
+            if pos.get('broker_sl'):
+                self.release_stop(pos)
+                if self.sync_position(name, now, own_exit=True):
+                    return
+                if pos['broker_sl'].get('status') == 'COMPLETE':
+                    raise StopOrderError('Stop filled but position book is not flat yet; no extra sell')
             self.verify_entry(pos)
             result = self.submit(name, leg, 'S' if leg['action'] == 'B' else 'B', reason,
                                  entry_order_id=pos['entry_order_id'])
@@ -553,11 +681,53 @@ def normalize(rows, now):
     return [candles[t] for t in sorted(candles)]
 
 
+def timeframe_for(market):
+    return CRUDE_TIMEFRAME_MINUTES if market == 'CRUDE' else NIFTY_TIMEFRAME_MINUTES
+
+
 def fresh_forming(candles, now, timeframe=None):
     if not candles:
         return False
     dt = datetime.fromisoformat(candles[-1]['datetime'])
-    return dt.date() == now.date() and timedelta(0) <= now-dt < timedelta(minutes=TIMEFRAME_MINUTES if timeframe is None else timeframe)
+    return dt.date() == now.date() and timedelta(0) <= now-dt < timedelta(minutes=timeframe_for(MARKET) if timeframe is None else timeframe)
+
+
+def fetch_strategy_candles(broker, token, exchange, market, start, now):
+    """Return completed bars only; never reconstruct or trade a forming bar."""
+    interval = timeframe_for(market)
+    rows = broker.candles(token, start, int(now.timestamp()), exchange=exchange, interval=interval)
+    candles = normalize(rows, now)
+    closed = [c for c in candles if datetime.fromisoformat(c['datetime'])+timedelta(minutes=interval) <= now]
+    latest = datetime.fromisoformat(closed[-1]['datetime'])+timedelta(minutes=interval) if closed else None
+    if latest is None or now-latest > timedelta(minutes=interval, seconds=120):
+        # Retry a narrow recent request when broad history is delayed/capped.
+        day_start = now.replace(hour=9, minute=0 if market == 'CRUDE' else 15, second=0, microsecond=0)
+        recent = normalize(broker.candles(token, int(day_start.timestamp()), int(now.timestamp()),
+                                         exchange=exchange, interval=interval), now)
+        merged = {c['datetime']: c for c in candles}
+        merged.update({c['datetime']: c for c in recent})
+        closed = [merged[t] for t in sorted(merged)
+                  if datetime.fromisoformat(t)+timedelta(minutes=interval) <= now]
+        latest = datetime.fromisoformat(closed[-1]['datetime'])+timedelta(minutes=interval) if closed else None
+    if latest is None or now-latest > timedelta(minutes=interval, seconds=120):
+        print(f'{market}: poll={now.isoformat()} latest_closed={latest} interval={interval}', flush=True)
+        raise ValueError('Recent completed candle unavailable; signals skipped; broker SL remains active independently')
+    return closed
+
+
+def closed_observation(strategy, executor, candles):
+    """Consume each completed bar once, using consecutive closed WT readings."""
+    state = executor.state(strategy.name)
+    stamp = candles[-1]['datetime']
+    if state.get('last_closed_candle') and stamp <= state['last_closed_candle']:
+        return None
+    observation = strategy.observe(candles, None)
+    state['last_closed_candle'] = stamp
+    if state.pop('baseline_required', False):
+        observation['signal'] = None
+    state['previous'] = observation['value']
+    executor.store.save()  # A failed entry must not repeat this candle's alert.
+    return observation
 
 
 def manage(strategy, executor, observation, spot, now, allow_entry=True):
@@ -574,12 +744,16 @@ def manage(strategy, executor, observation, spot, now, allow_entry=True):
     signal = observation['signal'] if observation else None
     if signal and signal != state['stopped_side']:
         state['stopped_side'] = None
-    if position:
-        adverse = position['spot_entry']-spot if position['side'] == 'LONG' else spot-position['spot_entry']
+    if position and not executor.live:
+        # Paper mode models premium SL; live protection rests at the broker.
+        if position.get('leg'):
+            adverse = position['fill'] - executor.broker.option_price(position['leg'])
+        else:
+            adverse = position['spot_entry']-spot if position['side'] == 'LONG' else spot-position['spot_entry']
         sl_points = CRUDE_SL_POINTS if MARKET == 'CRUDE' else NIFTY_SL_POINTS
         if sl_points and adverse >= sl_points:
             side = position['side']
-            executor.exit(strategy.name, spot, now, f'{MARKET} underlying SL')
+            executor.exit(strategy.name, spot, now, f'{MARKET} premium SL')
             state['stopped_side'] = None if signal and signal != side else side
             position = None
     if signal and position and position['side'] != signal:
@@ -619,7 +793,7 @@ def cycle(broker, executor, strategies, token, now, allow_entry=True):
                     raise RuntimeError('Cannot change crude feed with an open position')
                 for st in strategies:
                     executor.state(st.name).update(previous=None, stopped_side=None)
-                executor.store.data['history_start'] = int((now-timedelta(days=max(14, math.ceil(TIMEFRAME_MINUTES*100/300)*2))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+                executor.store.data['history_start'] = int((now-timedelta(days=max(14, math.ceil(timeframe_for(MARKET)*100/300)*2))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
             executor.store.data['crude_feed'] = feed = new_feed
             executor.store.save()
         token = feed['token']
@@ -634,15 +808,12 @@ def cycle(broker, executor, strategies, token, now, allow_entry=True):
     for strategy in strategies:
         manage(strategy, executor, None, spot, now, allow_entry=allow_entry)
     start = int(executor.store.data['history_start'])
-    rows = broker.candles(token, start, int(now.timestamp()), exchange=exchange, interval=TIMEFRAME_MINUTES)
-    candles = normalize(rows, now)
-    if not fresh_forming(candles, now):
-        raise ValueError('Current forming candle missing; skipping signals (SL was checked)')
+    candles = fetch_strategy_candles(broker, token, exchange, MARKET, start, now)
     for strategy in strategies:
         state = executor.state(strategy.name)
-        observation = strategy.observe(candles, state['previous'])
-        if state.pop('baseline_required', False):
-            observation['signal'] = None
+        observation = closed_observation(strategy, executor, candles)
+        if observation is None:
+            continue
         manage(strategy, executor, observation, spot, now, allow_entry=allow_entry)
         print(f"{now.isoformat()} {strategy.name} {MARKET}={spot} WT1={observation['value']} signal={observation['signal']}", flush=True)
 
@@ -652,7 +823,7 @@ def cycle(broker, executor, strategies, token, now, allow_entry=True):
 SETTINGS_NAMES = (
     'NIFTY', 'NIFTY_START_TIME', 'NIFTY_END_TIME',
     'CRUDE', 'CRUDE_START_TIME', 'CRUDE_END_TIME',
-    'TIMEFRAME_MINUTES', 'CHANNEL_LENGTH', 'AVERAGE_LENGTH', 'SIGNAL_LENGTH', 'NIFTY_SL_POINTS', 'CRUDE_SL_POINTS',
+    'NIFTY_TIMEFRAME_MINUTES', 'CRUDE_TIMEFRAME_MINUTES', 'CHANNEL_LENGTH', 'AVERAGE_LENGTH', 'SIGNAL_LENGTH', 'NIFTY_SL_POINTS', 'CRUDE_SL_POINTS', 'SL_LIMIT_BUFFER',
 )
 
 
@@ -681,12 +852,13 @@ def read_settings(path=None):
             raise ValueError(f'{market} must be True or False')
         if settings[f'{market}_START_TIME'] >= settings[f'{market}_END_TIME']:
             raise ValueError(f'{market} start must be before end')
-    if type(settings['TIMEFRAME_MINUTES']) is not int or settings['TIMEFRAME_MINUTES'] not in (1, 3, 5, 10, 15, 30, 60, 120, 240):
-        raise ValueError('Unsupported timeframe')
+    for name in ('NIFTY_TIMEFRAME_MINUTES', 'CRUDE_TIMEFRAME_MINUTES'):
+        if type(settings[name]) is not int or settings[name] not in (1, 3, 5, 10, 15, 30, 60, 120, 240):
+            raise ValueError(f'Unsupported timeframe: {name}')
     for name in ('CHANNEL_LENGTH', 'AVERAGE_LENGTH', 'SIGNAL_LENGTH'):
         if type(settings[name]) is not int or settings[name] < 1:
             raise ValueError(f'{name} must be a positive integer')
-    for name in ('NIFTY_SL_POINTS', 'CRUDE_SL_POINTS'):
+    for name in ('NIFTY_SL_POINTS', 'CRUDE_SL_POINTS', 'SL_LIMIT_BUFFER'):
         sl = settings[name]
         if type(sl) not in (int, float) or not math.isfinite(sl) or sl < 0:
             raise ValueError(f'{name} must be finite and nonnegative')
@@ -696,11 +868,15 @@ def read_settings(path=None):
 def apply_settings(settings, store):
     snapshot = {k: v.isoformat() if isinstance(v, dtime) else v for k,v in settings.items()}
     prior = store.data.get('settings', {})
-    indicator_keys = ('TIMEFRAME_MINUTES', 'CHANNEL_LENGTH', 'AVERAGE_LENGTH', 'SIGNAL_LENGTH')
-    if prior and any(prior.get(k) != snapshot[k] for k in indicator_keys):
-        # Keep orders, entry prices and SL locks; discard only the old indicator comparison.
-        for state in store.data.get('strategies', {}).values():
-            state['previous'] = None
+    indicator_keys = ('CHANNEL_LENGTH', 'AVERAGE_LENGTH', 'SIGNAL_LENGTH')
+    for market in ('NIFTY', 'CRUDE'):
+        keys = (*indicator_keys, f'{market}_TIMEFRAME_MINUTES')
+        if prior and any(prior.get(k) != snapshot[k] for k in keys):
+            state = store.data.get('strategies', {}).get(f'wt_cross_{market.lower()}')
+            if state is not None:
+                state['previous'] = None
+                state.pop('last_closed_candle', None)
+                state['baseline_required'] = True
     globals().update(settings)
     if prior != snapshot:
         print('Updated settings:', json.dumps(snapshot), flush=True)
@@ -778,15 +954,11 @@ def scan_while_blocked(broker, executor, strategy, market, nifty_token, now):
         token, exchange = feed['token'], 'MCX'
     else:
         token, exchange = nifty_token, 'NSE'
-    rows = broker.candles(token, executor.store.data['history_start'],
-                          int(now.timestamp()), exchange=exchange, interval=TIMEFRAME_MINUTES)
-    candles = normalize(rows, now)
-    if not fresh_forming(candles, now):
-        return
+    candles = fetch_strategy_candles(broker, token, exchange, market, executor.store.data['history_start'], now)
     state = executor.state(strategy.name)
-    observation = strategy.observe(candles, state['previous'])
-    state['previous'] = observation['value']
-    executor.store.save()
+    observation = closed_observation(strategy, executor, candles)
+    if observation is None:
+        return
     print(f"{now.isoformat()} {strategy.name} scanning: WT1={observation['value']} "
           f"signal={observation['signal']} | orders blocked pending reconciliation; alert not queued", flush=True)
 
@@ -821,7 +993,7 @@ def run(broker, args):
                 config_ok = False
                 print(f'Invalid settings ({type(error).__name__}); keeping last valid settings for exits; new entries blocked.', flush=True)
             now = datetime.now(IST)
-            anchor = int((now-timedelta(days=max(14, math.ceil(TIMEFRAME_MINUTES*100/300)*2))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            anchor = int((now-timedelta(days=max(14, math.ceil(max(NIFTY_TIMEFRAME_MINUTES, CRUDE_TIMEFRAME_MINUTES)*100/300)*2))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
             store.data['history_start'] = min(anchor, store.data.get('history_start', anchor))
             store.save()
             poll_errors = []
@@ -833,7 +1005,14 @@ def run(broker, args):
                 ENTRY_START, EXIT_TIME = settings[f'{market}_START_TIME'], settings[f'{market}_END_TIME']
                 try:
                     executor.sync_position(strategy.name, now)
+                    recorded = executor.state(strategy.name)['position']
+                    if recorded and datetime.fromisoformat(recorded['time']).date() == now.date() and ENTRY_START <= now.time() < EXIT_TIME:
+                        try:
+                            executor.protect_position(strategy.name, now)
+                        except StopOrderError as stop_error:
+                            print(f'{market}: broker SL needs attention: {stop_error}; exit checks still run', flush=True)
                     cycle(broker, executor, [strategy], args.nifty_token, now, allow_entry=enabled)
+                    executor.protect_position(strategy.name, now)
                     last_alerts.pop(market, None)
                 except Exception as error:
                     if store.data.get('pending'):
@@ -860,15 +1039,15 @@ def check_connection(broker, args):
     """Read-only diagnostic: no Executor, no orders and no position mutations."""
     settings = read_settings()
     now = datetime.now(IST)
-    interval = settings['TIMEFRAME_MINUTES']
-    days = max(14, math.ceil(interval*100/300)*2)
-    start = int((now-timedelta(days=days)).replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
     failed = False
     for market in ('NIFTY', 'CRUDE'):
         if not settings[market]:
             print(f'{market}: disabled; skipped')
             continue
         try:
+            interval = settings[f'{market}_TIMEFRAME_MINUTES']
+            days = max(14, math.ceil(interval*100/300)*2)
+            start = int((now-timedelta(days=days)).replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
             selector = OptionSelector(broker, args.lots, market)
             if market == 'CRUDE':
                 feed = resolve_crude_feed(broker, now.date())
