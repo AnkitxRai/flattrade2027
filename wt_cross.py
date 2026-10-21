@@ -240,7 +240,7 @@ class Executor:
         if store.data.get('mode', mode) != mode:
             raise ValueError('Use separate state files for paper and live')
         if fresh_alerts:
-            self.archive_attempts('startup: previous attempts retained without retry')
+            self.archive_attempts('startup: previous attempts retained without retry', preserve_positions=True)
         elif store.data.get('pending'):
             self.recover_pending()
         store.data['mode'] = mode
@@ -248,7 +248,7 @@ class Executor:
         store.data.setdefault('events', [])
         store.save()
 
-    def archive_attempts(self, reason):
+    def archive_attempts(self, reason, preserve_positions=False):
         """Retain unresolved intents and exposed positions without resubmission."""
         pending = self.store.data.pop('pending', None)
         unresolved = self.store.data.pop('unresolved_orders', {})
@@ -261,7 +261,7 @@ class Executor:
                 'resolution': 'unconfirmed_no_retry', 'reason': reason, 'intent': intent})
         # An interrupted exit must not be submitted again after a restart.
         for name, state in self.store.data.get('strategies', {}).items():
-            if state.get('close_attempted') and state.get('position'):
+            if not preserve_positions and state.get('close_attempted') and state.get('position'):
                 self.store.data.setdefault('unmanaged_positions', []).append({
                     'strategy': name, 'position': state['position'],
                     'reason': 'close outcome unconfirmed; no automatic retry'})
@@ -284,9 +284,13 @@ class Executor:
 
     def exit(self, name, spot, now, reason):
         if not self.fresh_alerts:
+            if self.live and self.sync_position(name, now):
+                return
             return self._exit(name, spot, now, reason)
         state = self.state(name)
         if not state['position']:
+            return
+        if self.live and self.sync_position(name, now):
             return
         state['close_attempted'] = now.isoformat()
         self.store.save()
@@ -461,6 +465,37 @@ class Executor:
                     return
         raise RuntimeError('Recorded entry ID does not match confirmed contract/quantity; no exit sent')
 
+    def sync_position(self, name, now):
+        """Check the recorded contract/product; never assume an API failure is flat."""
+        state = self.state(name)
+        position = state['position']
+        if not self.live or not position:
+            return False
+        leg = position['leg']
+        rows = self.broker.positions()
+        if not isinstance(rows, list):
+            raise RuntimeError('Position lookup unavailable; no exit sent')
+        quantity = sum(int(row['netqty']) for row in rows
+                       if row.get('exch') == leg['exchange']
+                       and row.get('tsym') == leg['symbol']
+                       and row.get('prd') == leg['product'])
+        if quantity == 0:
+            self.store.data.setdefault('position_history', []).append({
+                'strategy': name, 'time': now.isoformat(), 'position': position,
+                'status': 'externally_closed', 'exit_price': None})
+            state['position'] = None
+            state.pop('close_attempted', None)
+            state['baseline_required'] = True
+            self.store.save()
+            notify(self.broker, f"ℹ️ {name}: broker confirms {leg['symbol']} is flat; recorded as external/manual close. Waiting for a fresh crossover.")
+            return True
+        expected = leg['quantity'] * (1 if leg['action'] == 'B' else -1)
+        if quantity != expected:
+            raise RuntimeError(f'{name}: broker quantity {quantity} differs from recorded {expected}; no automatic exit sent')
+        if state.get('close_attempted'):
+            raise RuntimeError(f'{name}: prior exit outcome uncertain; position retained, no duplicate exit sent')
+        return False
+
     def _exit(self, name, spot, now, reason):
         state = self.state(name)
         pos = state['position']
@@ -604,6 +639,8 @@ def cycle(broker, executor, strategies, token, now, allow_entry=True):
     for strategy in strategies:
         state = executor.state(strategy.name)
         observation = strategy.observe(candles, state['previous'])
+        if state.pop('baseline_required', False):
+            observation['signal'] = None
         manage(strategy, executor, observation, spot, now, allow_entry=allow_entry)
         print(f"{now.isoformat()} {strategy.name} {MARKET}={spot} WT1={observation['value']} signal={observation['signal']}", flush=True)
 
@@ -760,21 +797,9 @@ def run(broker, args):
     with state_path.with_suffix('.lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         store = Store(state_path)
-        states = store.data.setdefault('strategies', {})
-        # Migrate the earlier single-market ledger without losing an open trade.
-        if 'wt_cross' in states:
-            old_market = store.data.get('context', {}).get('market', 'NIFTY').lower()
-            key = f'wt_cross_{old_market}'
-            if key in states:
-                raise ValueError('Conflicting legacy and per-market strategy states')
-            states[key] = states.pop('wt_cross')
-        if not args.state:
-            # Never silently ignore positions in the previous per-timeframe files.
-            mode = 'live' if args.live else 'paper'
-            for old_path in ROOT.glob(f'{mode}_*_state.json'):
-                old = json.loads(old_path.read_text())
-                if old.get('pending') or any(st.get('position') for st in old.get('strategies', {}).values()):
-                    raise ValueError(f'Open trade/order in legacy state {old_path.name}; reconcile before using the combined runner')
+        for state in store.data.get('strategies', {}).values():
+            state['baseline_required'] = True
+        print('Resume: saved positions will be checked against broker positions.', flush=True)
         apply_settings(settings, store)
         park_pending(store)
         last_alerts = {}
@@ -805,6 +830,7 @@ def run(broker, args):
                 MARKET = market
                 ENTRY_START, EXIT_TIME = settings[f'{market}_START_TIME'], settings[f'{market}_END_TIME']
                 try:
+                    executor.sync_position(strategy.name, now)
                     cycle(broker, executor, [strategy], args.nifty_token, now, allow_entry=enabled)
                     last_alerts.pop(market, None)
                 except Exception as error:
